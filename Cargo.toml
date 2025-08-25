@@ -1,0 +1,17 @@
+[package]
+name = "gurarderd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.40", features = ["derive"] }
+nix = {version = "*", features = ["signal"]}
+chrono = "*" 
+ctrlc = {version ="*", features = ["termination"]}
+fs2 = "*"
+anyhow = "*"
+
+[profile.release]
+opt-level = 'z'
+lto = true
+codegen-units = 1
