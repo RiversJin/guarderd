@@ -1,4 +1,4 @@
-# Gurarderd
+# Guarderd
 
 A lightweight process guard daemon written in Rust that monitors and automatically restarts processes when they exit or crash.
 
@@ -17,12 +17,12 @@ A lightweight process guard daemon written in Rust that monitors and automatical
 ### From Source
 
 ```bash
-git clone https://github.com/RiversJin/gurarderd.git
-cd gurarderd
+git clone https://github.com/RiversJin/guarderd.git
+cd guarderd
 cargo build --release
 ```
 
-The binary will be available at `target/release/gurarderd`.
+The binary will be available at `target/release/guarderd`.
 
 ### Recommended: Using Zig Build
 
@@ -41,7 +41,7 @@ This approach produces binaries that are more portable and can run on different 
 ### Start Monitoring a Process
 
 ```bash
-gurarderd start [OPTIONS] -- <COMMAND>
+guarderd start [OPTIONS] -- <COMMAND>
 ```
 
 **Options:**
@@ -52,19 +52,19 @@ gurarderd start [OPTIONS] -- <COMMAND>
 
 ```bash
 # Monitor a simple command with default settings
-gurarderd start -- python my_script.py
+guarderd start -- python my_script.py
 
 # Monitor with custom restart interval
-gurarderd start --restart-interval 10 -- ./my_application
+guarderd start --restart-interval 10 -- ./my_application
 
 # Monitor with custom restart interval and log size
-gurarderd start --restart-interval 30 --max-log-size-mib 50 -- node server.js
+guarderd start --restart-interval 30 --max-log-size-mib 50 -- node server.js
 ```
 
 ### Check Daemon Status
 
 ```bash
-gurarderd status
+guarderd status
 ```
 
 This will show the daemon PID, child process PID, and their running status.
@@ -72,14 +72,14 @@ This will show the daemon PID, child process PID, and their running status.
 ### Stop the Daemon
 
 ```bash
-gurarderd stop
+guarderd stop
 ```
 
 This will gracefully stop the daemon and the monitored process.
 
 ## How It Works
 
-1. **Daemon Creation**: When started, gurarderd forks itself into a background daemon process
+1. **Daemon Creation**: When started, guarderd forks itself into a background daemon process
 2. **Process Monitoring**: The daemon spawns and monitors the specified command
 3. **Automatic Restart**: If the monitored process exits, the daemon waits for the configured interval and restarts it
 4. **Log Capture**: All stdout/stderr from the monitored process is captured and written to `guarderd.status.d/stdout.log`
@@ -88,7 +88,7 @@ This will gracefully stop the daemon and the monitored process.
 
 ## File Structure
 
-When running, gurarderd creates a `guarderd.status.d/` directory containing:
+When running, guarderd creates a `guarderd.status.d/` directory containing:
 
 - `pid`: Contains daemon and child process PIDs
 - `lock`: Lock file to prevent multiple daemon instances

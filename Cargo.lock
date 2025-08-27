@@ -199,7 +199,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gurarderd"
+name = "guarderd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
