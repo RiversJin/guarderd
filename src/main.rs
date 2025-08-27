@@ -24,7 +24,6 @@ fn daemonize() -> Result<Pid> {
         std::process::exit(0);
     }
 
-    unistd::chdir("/")?;
     Ok(unistd::getpid())
 }
 
