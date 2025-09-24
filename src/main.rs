@@ -4,17 +4,30 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use fs2::FileExt;
 use nix::{
-    libc::{self, prctl}, sys::signal::kill, unistd::{self, dup2_stderr, dup2_stdout, ForkResult, Pid}
+    libc::{self, mmap64, prctl},
+    sys::signal::kill,
+    unistd::{self, ForkResult, Pid, dup2_stderr, dup2_stdout},
 };
 use std::{
-    fs::{File, OpenOptions}, io::{Read, Write}, os::unix::process::CommandExt, path::PathBuf, process::{exit, Command}, sync::{atomic::AtomicBool, Arc, Mutex}, thread, time::Duration
+    fs::{File, OpenOptions},
+    io::{Read, Write},
+    os::unix::process::CommandExt,
+    path::PathBuf,
+    process::{exit, Command},
+    sync::{
+        atomic::{AtomicBool, AtomicU64}, Arc, Mutex
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 const STATUS_PATH: &str = "guarderd.status.d";
 const DEFAULT_MAX_LOG_SIZE_MIB: u64 = 10;
 
-fn daemonize() -> Result<Pid> {
+
+fn daemonize(parent_cb: impl FnOnce()) -> Result<Pid> {
     if let ForkResult::Parent { .. } = unsafe { unistd::fork()? } {
+        parent_cb();
         std::process::exit(0);
     }
 
@@ -34,6 +47,28 @@ fn is_process_exist(pid: impl Into<Pid>) -> bool {
         Err(nix::errno::Errno::ESRCH) => false,
         Err(_) => true,
     }
+}
+
+fn make_shared_counter() -> &'static AtomicU64 {
+    let addr = unsafe {
+        mmap64(
+            std::ptr::null_mut(),
+            std::mem::size_of::<AtomicU64>(),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+
+    if addr == libc::MAP_FAILED {
+        panic!("mmap64 failed");
+    }
+
+    let counter = unsafe { &mut *(addr as *mut AtomicU64) };
+    counter.store(0, std::sync::atomic::Ordering::SeqCst);
+    
+    counter
 }
 
 #[derive(Debug)]
@@ -113,15 +148,19 @@ impl Daemon {
             if let Some((key, value)) = line.split_once(':') {
                 let key = key.trim();
                 let value = value.trim();
-                
+
                 match key {
                     "daemon_pid" => {
-                        daemon_pid = Some(value.parse::<i32>()
-                            .with_context(|| format!("failed to parse daemon_pid: {}", value))?);
+                        daemon_pid =
+                            Some(value.parse::<i32>().with_context(|| {
+                                format!("failed to parse daemon_pid: {}", value)
+                            })?);
                     }
                     "child_pid" => {
-                        child_pid = Some(value.parse::<i32>()
-                            .with_context(|| format!("failed to parse child_pid: {}", value))?);
+                        child_pid =
+                            Some(value.parse::<i32>().with_context(|| {
+                                format!("failed to parse child_pid: {}", value)
+                            })?);
                     }
                     _ => {
                         // Ignore unknown keys for forward compatibility
@@ -130,8 +169,10 @@ impl Daemon {
             }
         }
 
-        let daemon_pid = daemon_pid.ok_or_else(|| anyhow::anyhow!("daemon_pid not found in PID file"))?;
-        let child_pid = child_pid.ok_or_else(|| anyhow::anyhow!("child_pid not found in PID file"))?;
+        let daemon_pid =
+            daemon_pid.ok_or_else(|| anyhow::anyhow!("daemon_pid not found in PID file"))?;
+        let child_pid =
+            child_pid.ok_or_else(|| anyhow::anyhow!("child_pid not found in PID file"))?;
 
         Ok((Pid::from_raw(daemon_pid), Pid::from_raw(child_pid)))
     }
@@ -185,7 +226,24 @@ impl Daemon {
         Ok(())
     }
 
-    fn start(&mut self, command: Vec<String>, restart_interval: Duration, max_log_size: u64) {
+    fn wait_for_child_grace_period(&self, cnt: &AtomicU64, grace_deadline: Instant) {
+        while Instant::now() < grace_deadline {
+            if cnt.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                println!(
+                    "[{}] Child process exited in grace period, startup failed",
+                    Utc::now().to_rfc3339()
+                );
+                std::process::exit(1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        println!(
+            "[{}] Start successful, exiting grace period",
+            Utc::now().to_rfc3339()
+        );
+    }
+
+    fn start(&mut self, command: Vec<String>, restart_interval: Duration, max_log_size: u64, grace_period: Duration) {
         if let Err(err) = self.try_lock() {
             println!(
                 "Failed to acquire lock: {}, may be another instance is running",
@@ -194,7 +252,10 @@ impl Daemon {
             return;
         }
 
-        let daemon_pid = daemonize().expect("Failed to daemonize");
+        let cnt = make_shared_counter();
+        let grace_deadline = Instant::now() + grace_period;
+
+        let daemon_pid = daemonize(|| self.wait_for_child_grace_period(cnt, grace_deadline)).expect("Failed to daemonize");
 
         self.running
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -214,16 +275,30 @@ impl Daemon {
                     .stderr(std::process::Stdio::inherit())
                     .pre_exec(|| {
                         prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                         std::io::Result::Ok(())
+                        std::io::Result::Ok(())
                     })
                     .spawn()
-            }.expect("Failed to spawn child process");
+            }.unwrap_or_else(|e| {
+                eprintln!("Failed to spawn child process: {}", e);
+                cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::process::exit(1);
+            });
 
             let child_pid = Pid::from_raw(child.id() as i32);
             self.child_pid.lock().unwrap().replace(child_pid);
-            self.save_pids(daemon_pid, child_pid).expect("Failed to save PIDs");
+            self.save_pids(daemon_pid, child_pid)
+                .expect("Failed to save PIDs");
 
             let status = child.wait().expect("Failed to wait for child process");
+            cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            if Instant::now() < grace_deadline {
+                println!(
+                    "[{}] Child process exited in grace period, startup failed",
+                    Utc::now().to_rfc3339()
+                );
+                std::process::exit(1);
+            }
 
             println!(
                 "[{}] Child process {} exited with status {}",
@@ -247,10 +322,13 @@ impl Daemon {
                 }
             }
         }
-
     }
 
-    fn spawn_log_thread(&self, reader: impl Read + Send + 'static, max_log_size: u64) -> thread::JoinHandle<()> {
+    fn spawn_log_thread(
+        &self,
+        reader: impl Read + Send + 'static,
+        max_log_size: u64,
+    ) -> thread::JoinHandle<()> {
         let running = self.running.clone();
         let log_file = OpenOptions::new()
             .create(true)
@@ -258,7 +336,11 @@ impl Daemon {
             .open(&self.log_path)
             .expect("Failed to open log file");
 
-        self.log_file.lock().unwrap().replace(log_file.try_clone().expect("Failed to clone log file handle"));
+        self.log_file.lock().unwrap().replace(
+            log_file
+                .try_clone()
+                .expect("Failed to clone log file handle"),
+        );
 
         thread::spawn(move || {
             let mut reader = reader;
@@ -320,10 +402,16 @@ impl Daemon {
                 _ = kill(*pid, nix::sys::signal::Signal::SIGTERM);
             }
             running.store(false, std::sync::atomic::Ordering::Relaxed);
-            println!("[{}] Daemon: Received Ctrl-C, shutting down...", Utc::now().to_rfc3339());
-            log_file.lock().unwrap().as_mut().map(|f| f.sync_all().expect("Failed to sync log file"));
+            println!(
+                "[{}] Daemon: Received Ctrl-C, shutting down...",
+                Utc::now().to_rfc3339()
+            );
+            log_file
+                .lock()
+                .unwrap()
+                .as_mut()
+                .map(|f| f.sync_all().expect("Failed to sync log file"));
             exit(0);
-
         })
         .expect("Failed to set Ctrl-C handler");
     }
@@ -335,7 +423,6 @@ impl Daemon {
         println!("Daemon PID: {}, running: {}", daemon_pid, is_daemon_running);
         println!("Child PID: {}, running: {}", child_pid, is_child_running);
     }
-
 }
 
 #[derive(Parser, Debug)]
@@ -344,7 +431,6 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
-
 
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -355,7 +441,6 @@ enum Commands {
     /// Show the status of the guard
     Status,
 }
-
 
 #[derive(Args, Debug)]
 struct StartArgs {
@@ -370,6 +455,10 @@ struct StartArgs {
     /// The maximum size of the log file (in MiB)
     #[arg(long, default_value_t = DEFAULT_MAX_LOG_SIZE_MIB)]
     max_log_size_mib: u64,
+
+    /// The grace period (in seconds) to consider the child process started successfully
+    #[arg(long, default_value_t = 5)]
+    grace_period: u64,
 }
 
 fn main() -> Result<()> {
@@ -377,7 +466,12 @@ fn main() -> Result<()> {
     let mut daemon = Daemon::new()?;
     match cli.command {
         Commands::Start(args) => {
-            daemon.start(args.command, Duration::from_secs(args.restart_interval), args.max_log_size_mib);
+            daemon.start(
+                args.command,
+                Duration::from_secs(args.restart_interval),
+                args.max_log_size_mib,
+                Duration::from_secs(args.grace_period),
+            );
         }
         Commands::Stop => {
             daemon.stop()?;
